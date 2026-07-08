@@ -166,10 +166,6 @@ type CodexAppServerAdapter struct {
 	// cancelGraceWindow bounds the graceful-interrupt wait in Cancel before the
 	// process is force-closed. Zero falls back to the default.
 	cancelGraceWindow time.Duration
-	// cliVersionMu/cliVersionCached memoize the served CLI's --version result
-	// per adapter instance (each instance owns one command).
-	cliVersionMu     sync.Mutex
-	cliVersionCached string
 	// startupModelRetryBackoffs is the wait schedule between background model/list
 	// refetches when the initial probe came back empty; the slice length bounds
 	// the number of retries. Nil falls back to defaultStartupModelRetryBackoffs.
@@ -306,6 +302,14 @@ func NewTuttiAgentAppServerAdapterWithHostMetadata(transport ProcessTransport, h
 	return newAppServerAdapter(transport, host, tuttiAgentAppServerAdapterConfig(), nil)
 }
 
+func newCodexAppServerAdapterWithHostMetadataAndResolver(
+	transport ProcessTransport,
+	host HostMetadata,
+	commandResolver ProviderCommandResolver,
+) *CodexAppServerAdapter {
+	return NewCodexAppServerAdapterWithHostMetadataAndCommandResolver(transport, host, commandResolver)
+}
+
 func newAppServerAdapter(
 	transport ProcessTransport,
 	host HostMetadata,
@@ -331,18 +335,29 @@ func newAppServerAdapter(
 // by upstreams that gate on an "official Codex client" allowlist.
 const codexOfficialOriginator = "codex_cli_rs"
 
-// resolveCLIVersion returns the version of the binary that serves the
-// app-server (e.g. "0.142.1"), resolved with the same env (PATH) the
-// app-server is spawned with so the two agree. The result is cached per
-// adapter after the first successful lookup; an empty string signals
-// "unknown" so callers can fall back.
-func (a *CodexAppServerAdapter) resolveCLIVersion(env []string) string {
-	a.cliVersionMu.Lock()
-	defer a.cliVersionMu.Unlock()
-	if a.cliVersionCached != "" {
-		return a.cliVersionCached
+var (
+	codexCLIVersionMu        sync.Mutex
+	codexCLIVersionByCommand = map[string]string{}
+)
+
+// resolveCodexCLIVersion returns the version of the codex binary that serves
+// the app-server (e.g. "0.142.1"), resolved with the same env (PATH) the
+// app-server is spawned with so the two agree. The result is cached after the
+// first successful lookup; an empty string signals "unknown" so callers can
+// fall back.
+func resolveCodexCLIVersion(command []string, env []string) string {
+	binary := codexAppServerCommand
+	if len(command) > 0 && strings.TrimSpace(command[0]) != "" {
+		binary = strings.TrimSpace(command[0])
 	}
-	cmd := exec.Command(a.config.command[0], "--version")
+	cacheKey := binary
+	codexCLIVersionMu.Lock()
+	if cached := codexCLIVersionByCommand[cacheKey]; cached != "" {
+		codexCLIVersionMu.Unlock()
+		return cached
+	}
+	codexCLIVersionMu.Unlock()
+	cmd := exec.Command(binary, "--version")
 	if len(env) > 0 {
 		cmd.Env = env
 	}
@@ -355,20 +370,22 @@ func (a *CodexAppServerAdapter) resolveCLIVersion(env []string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	a.cliVersionCached = strings.TrimSpace(fields[len(fields)-1])
-	return a.cliVersionCached
+	version := strings.TrimSpace(fields[len(fields)-1])
+	codexCLIVersionMu.Lock()
+	codexCLIVersionByCommand[cacheKey] = version
+	codexCLIVersionMu.Unlock()
+	return version
 }
 
-// clientInfoParams builds the app-server initialize clientInfo. The served
-// CLI derives its outbound originator/User-Agent from clientInfo.name, so the
-// name comes from the adapter config: the official Codex originator for the
-// codex provider, the Tutti identity for tutti-agent.
-func (a *CodexAppServerAdapter) clientInfoParams(env []string) map[string]any {
-	return clientInfoParamsForVersion(a.host, a.config.clientInfoName, a.resolveCLIVersion(env))
+// codexClientInfoParams builds the app-server initialize clientInfo so the
+// outbound originator/User-Agent match the official Codex CLI, resolving the
+// codex binary version from the spawn env.
+func codexClientInfoParams(host HostMetadata, command []string, env []string) map[string]any {
+	return clientInfoParamsForVersion(host, codexOfficialOriginator, resolveCodexCLIVersion(command, env))
 }
 
-// codexClientInfoParamsForVersion composes the official Codex clientInfo for a
-// known codex version, falling back to the host-provided version when empty.
+// codexClientInfoParamsForVersion composes the clientInfo for a known codex
+// version, falling back to the host-provided version when it is empty.
 func codexClientInfoParamsForVersion(host HostMetadata, version string) map[string]any {
 	return clientInfoParamsForVersion(host, codexOfficialOriginator, version)
 }
@@ -385,6 +402,9 @@ func clientInfoParamsForVersion(host HostMetadata, name string, version string) 
 }
 
 func (a *CodexAppServerAdapter) Provider() string {
+	if a == nil || strings.TrimSpace(a.config.provider) == "" {
+		return ProviderCodex
+	}
 	return a.config.provider
 }
 
@@ -432,6 +452,9 @@ func (*CodexAppServerAdapter) ValidatePromptContent(Session, []PromptContentBloc
 }
 
 func (a *CodexAppServerAdapter) commandString() string {
+	if a == nil || len(a.config.command) == 0 {
+		return codexAppServerCommand + " " + codexAppServerSubcmd
+	}
 	return strings.Join(a.config.command, " ")
 }
 
@@ -844,7 +867,7 @@ func (a *CodexAppServerAdapter) startInitializedClient(
 
 	initializeResult, err := trace.TypedCall(acpStartCallTimeout, appServerMethodInitialize, func() (json.RawMessage, error) {
 		return client.Initialize(ctx, acpStartCallTimeout, map[string]any{
-			"clientInfo": a.clientInfoParams(spec.Env),
+			"clientInfo": codexClientInfoParams(a.host, spec.Command, spec.Env),
 			"capabilities": map[string]any{
 				"experimentalApi": true,
 			},
@@ -1407,33 +1430,6 @@ func (a *CodexAppServerAdapter) ExecAsync(
 	return nil
 }
 
-func (a *CodexAppServerAdapter) GuideActiveTurn(
-	ctx context.Context,
-	session Session,
-	content []PromptContentBlock,
-	displayPrompt string,
-	turnID string,
-	emit EventSink,
-	_ CommandSnapshotSink,
-) ([]activityshared.Event, error) {
-	appSession := a.getSession(session.AgentSessionID)
-	if appSession == nil || appSession.client == nil {
-		return nil, ErrSessionDisconnected
-	}
-	activeTurnID := a.sessionActiveTurnID(session.AgentSessionID)
-	if activeTurnID == "" {
-		return nil, ErrSessionNoActiveTurn
-	}
-	session.ProviderSessionID = appSession.threadID
-	explicitDisplayPrompt, visibleText := explicitAndVisiblePromptText(content, displayPrompt)
-	mentionRoutingApplied, mentionRoutingSkills := tuttiMentionRoutingSkills(visibleText)
-	providerContent := content
-	if mentionRoutingApplied {
-		providerContent = appendTuttiMentionRoutingContent(providerContent, mentionRoutingSkills)
-	}
-	return a.steerActiveTurn(ctx, appSession, session, content, providerContent, explicitDisplayPrompt, visibleText, turnID, activeTurnID, emit)
-}
-
 func (appTurn *codexAppServerActiveTurn) markTerminated() {
 	appTurn.terminatedOnce.Do(func() { close(appTurn.terminated) })
 }
@@ -1850,8 +1846,7 @@ func (*CodexAppServerAdapter) steerActiveTurn(
 	}
 	events := []activityshared.Event{
 		newTurnActivityEvent(session, EventMessage, turnID, "", RoleUser, displayPrompt, userPromptActivityPayload(content, explicitDisplayPrompt, userPromptActivityPayloadExtraFromExecMetadata(ctx, map[string]any{
-			"guidance": true,
-			"steered":  true,
+			"steered": true,
 		}))),
 	}
 	if emit != nil {

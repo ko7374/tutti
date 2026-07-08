@@ -271,43 +271,7 @@ func (s Service) authFromMarkerFile(spec ProviderSpec, path string) (AuthInfo, b
 		}
 		return AuthInfo{}, false
 	}
-	if spec.Provider == agentprovider.TuttiAgent {
-		if auth, ok := parseTuttiAgentAuthMarkerFile(path); ok {
-			return auth, true
-		}
-		return AuthInfo{}, false
-	}
 	return AuthInfo{Status: AuthAuthenticated}, true
-}
-
-// parseTuttiAgentAuthMarkerFile validates that the Tutti Agent auth.json holds
-// a usable `tutti_llm` token bundle instead of treating file existence as
-// authenticated.
-func parseTuttiAgentAuthMarkerFile(path string) (AuthInfo, bool) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return AuthInfo{}, false
-	}
-	var payload struct {
-		TuttiLLM *struct {
-			AppID        string `json:"app_id"`
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"tutti_llm"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return AuthInfo{}, false
-	}
-	if payload.TuttiLLM == nil ||
-		strings.TrimSpace(payload.TuttiLLM.AccessToken) == "" ||
-		strings.TrimSpace(payload.TuttiLLM.RefreshToken) == "" {
-		return AuthInfo{Status: AuthRequired}, true
-	}
-	return AuthInfo{
-		AccountLabel: payload.TuttiLLM.AppID,
-		AuthMethod:   "tutti_llm",
-		Status:       AuthAuthenticated,
-	}, true
 }
 
 func (s Service) resolveAuthFromCommand(ctx context.Context, spec ProviderSpec, binaryPath string) (AuthInfo, bool) {
@@ -338,10 +302,23 @@ func (s Service) runAuthStatusCommand(ctx context.Context, spec ProviderSpec, bi
 // whitespace field works for the former but yields "Code)" for the latter, so
 // we extract the version token instead.
 var cliVersionTokenPattern = regexp.MustCompile(`[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][0-9A-Za-z.-]+)?`)
+var codexOpenAIVersionLinePattern = regexp.MustCompile(`(?m)^\s*@openai/codex\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][0-9A-Za-z.-]+)?)\s*$`)
 
 // parseCLIVersion extracts the version token from `<cli> --version` output.
 func parseCLIVersion(output string) string {
 	return cliVersionTokenPattern.FindString(strings.TrimSpace(output))
+}
+
+func agentStatusCommandOverrideActive(envName string, binaryPath string) bool {
+	fields := strings.Fields(strings.TrimSpace(os.Getenv(envName)))
+	return len(fields) > 0 && strings.TrimSpace(binaryPath) == strings.TrimSpace(fields[0])
+}
+
+func parseCodexCLIVersion(output string) string {
+	if match := codexOpenAIVersionLinePattern.FindStringSubmatch(output); len(match) == 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return parseCLIVersion(output)
 }
 
 // cliVersion runs `<binary> --version` and returns the parsed version token, or
@@ -365,6 +342,9 @@ func (Service) cliVersion(ctx context.Context, binaryPath string, env []string) 
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return ""
+	}
+	if agentStatusCommandOverrideActive(codexCommandEnv, binaryPath) {
+		return parseCodexCLIVersion(string(output))
 	}
 	return parseCLIVersion(string(output))
 }
@@ -527,6 +507,11 @@ func runAuthStatusCommand(ctx context.Context, spec ProviderSpec, binaryPath str
 			return AuthInfo{}, false
 		}
 	}
+	if err == nil && agentprovider.Normalize(spec.Provider) == agentprovider.Codex &&
+		agentStatusCommandOverrideActive(codexCommandEnv, binaryPath) &&
+		strings.TrimSpace(string(output)) == "" {
+		return AuthInfo{Status: AuthAuthenticated}, true
+	}
 	return parseAuthStatusCommandOutput(spec.Provider, output)
 }
 
@@ -549,10 +534,6 @@ func parseAuthStatusCommandOutput(provider string, output []byte) (AuthInfo, boo
 	case agentprovider.ClaudeCode:
 		return parseClaudeAuthStatusOutput(output)
 	case agentprovider.Codex:
-		return parseCodexAuthStatusOutput(output)
-	case agentprovider.TuttiAgent:
-		// Tutti Agent is a Codex CLI fork; `tutti-agent login status` prints the
-		// same "Logged in ..." / "Not logged in" copy.
 		return parseCodexAuthStatusOutput(output)
 	case agentprovider.Cursor:
 		return parseCursorAuthStatusOutput(output)

@@ -173,7 +173,7 @@ func newDefaultClaudeCodeAdapter(
 	commandResolver ProviderCommandResolver,
 ) Adapter {
 	if claudeCodeSDKRuntimeEnabled() {
-		return NewClaudeCodeSDKAdapter(transport)
+		return NewClaudeCodeSDKAdapterWithCommandResolver(transport, commandResolver)
 	}
 	return newClaudeCodeAdapterWithHostMetadata(transport, host, commandResolver)
 }
@@ -451,7 +451,7 @@ func defaultPermissionModeIDForProvider(provider string) string {
 	switch strings.TrimSpace(provider) {
 	case ProviderClaudeCode:
 		return "default"
-	case ProviderCodex, ProviderTuttiAgent, ProviderNexight:
+	case ProviderCodex, ProviderNexight:
 		return "auto"
 	case ProviderCursor:
 		return "agent"
@@ -489,7 +489,7 @@ func permissionModeIDAllowedForProvider(provider string, mode string) bool {
 	switch strings.TrimSpace(provider) {
 	case ProviderClaudeCode:
 		return isClaudeCodePermissionModeID(mode)
-	case ProviderCodex, ProviderTuttiAgent, ProviderNexight:
+	case ProviderCodex, ProviderNexight:
 		switch strings.TrimSpace(mode) {
 		case "read-only", "auto", "full-access":
 			return true
@@ -2327,18 +2327,12 @@ func reconcileFinishedTurnStatus(session Session) Session {
 		session.SubmitAvailability = blockedSubmitAvailability("background_agent")
 		return session
 	}
-	if sessionStatusShouldReconcileToReady(session.Status) {
-		session.Status = SessionStatusReady
-	}
-	return session
-}
-
-func sessionStatusShouldReconcileToReady(status string) bool {
-	switch strings.TrimSpace(strings.ToLower(status)) {
-	case "", "created", "submitted", "running", "streaming", SessionStatusWorking:
-		return true
+	switch session.Status {
+	case SessionStatusFailed, SessionStatusCompleted, SessionStatusCanceled, SessionStatusReady:
+		return session
 	default:
-		return false
+		session.Status = SessionStatusReady
+		return session
 	}
 }
 
